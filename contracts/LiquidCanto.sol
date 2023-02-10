@@ -64,6 +64,9 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     mapping(uint256 => UnbondingStatus) public batch2UnbondingStatus;
     // Canto cosmos layer txn hash ==> reward accrued
     mapping(string => uint256) public txnHash2AccrueRewardAmount;
+    // validator address => time => amount
+    mapping(string => mapping(uint256 => uint256))
+        public validator2Time2AmountSlashed;
 
     struct UnbondRequest {
         // timestamp of when unlock request starts
@@ -81,8 +84,8 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     enum UnbondingStatus {
         PENDING_BOT, // batch is waiting for bot process
         PROCESSING, // bot started processing, new unbonding request will be in next batch
-        UNBONDING, // bot finished processing unbonding request for this batch
-        UNBONDED // batch is unbonded, user can claim
+        UNBONDING, // bot finished processing unbonding request for this batch，bot has successfully informed validator to start unbonding
+        UNBONDED // batch is unbonded, user can redeem canto
     }
 
     /// @notice Emitted when user stake Canto
@@ -158,6 +161,12 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         accrueNFT = new AccrueNFT(address(this));
         emit AccrueNFTCreate(address(accrueNFT));
+    }
+
+    // TODO Setup initial value
+    function init() private {
+        batch2UnbondingStatus[currentUnbondingBatchNo] = UnbondingStatus
+            .PENDING_BOT;
     }
 
     function _beforeTokenTransfer(
@@ -273,57 +282,6 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         return totalCantoAmt;
     }
 
-    function convertToShare(uint256 cantoAmount) public view returns (uint256) {
-        uint256 totalSupply = totalSupply();
-
-        if (totalSupply == 0) return cantoAmount;
-        uint256 share = (cantoAmount * totalSupply) / totalPooledCanto;
-        // Protect user in the case where user deposit in small amount resulting in 0 share
-        require(share > 0, "Invalid share");
-
-        return share;
-    }
-
-    function convertToAsset(uint256 shareAmount) public view returns (uint256) {
-        uint256 totalSupply = totalSupply();
-
-        if (totalSupply == 0) return 0;
-        return (shareAmount * totalPooledCanto) / totalSupply;
-    }
-
-    // TODO check this function ,to make sure all the time durations
-    /**
-     * @notice This is an estimation unlock date
-     * @return unboundUnlockDate if the user unbond now
-     */
-    function getUnbondUnlockDate() public view returns (uint256) {
-        // Check if previous batch is in PROCESSING status. If processing, assume unbonding will be successful
-        // soon and thus return unlockTime as block.timestamp + unbondingProcessingTime + unbondingDuration;
-        // Note: If this is not in place, it means that protocol will promise an earlier unlock date than possible
-        //       during this window of processing -> unbonding (1 hour)
-        if (currentUnbondingBatchNo > 0) {
-            if (
-                batch2UnbondingStatus[currentUnbondingBatchNo - 1] ==
-                UnbondingStatus.PROCESSING
-            ) {
-                return
-                    block.timestamp +
-                    unbondingProcessingTime +
-                    unbondingDuration;
-            }
-        }
-        uint256 nextUnbondTime = lastUnbondTime + unbondingProcessingTime;
-        if (nextUnbondTime < block.timestamp) {
-            // This happen when contract just deployed (lastUnbondTime = 0) or when the bot has not unbonded
-            // since 4 days 12 hours ago (unbondingProcessingTime), could be bot issue.
-            // If this is not in place, it means that the protocol will promise an earlier unlock date than possible
-            return
-                block.timestamp + unbondingProcessingTime + unbondingDuration;
-        }
-
-        return nextUnbondTime + unbondingDuration;
-    }
-
     // TODO
     /// @dev deposit CRO into the contract, meant mostly for IBCReceiver to call
     function deposit() external payable override {
@@ -433,11 +391,204 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     }
 
     // TODO need test
-    function pause() public onlyRole(DEFAULT_ADMIN_ROLE) {
+    function pauseDueSlashing() external onlyRole(ROLE_BOT) {
         _pause();
     }
 
-    function unpause() public onlyRole(DEFAULT_ADMIN_ROLE) {
-        _unpause();
+    function togglePause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        paused() ? _unpause() : _pause();
+    }
+
+    //TODO Need offchain work ensure new exchange rate cannot drop more than 20 percent.
+    function slashUnbondingRequests(
+        uint256[] calldata _tokenIds,
+        uint256[] calldata _newRates
+    ) external onlyRole(ROLE_SLASHER) {
+        require(
+            _tokenIds.length == _newRates.length,
+            "Both input length must match"
+        );
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            UnbondRequest storage request = nftToken2UnbondRequest[
+                _tokenIds[i]
+            ];
+            require(
+                request.liquidCanto2CantoExchangeRate > _newRates[i],
+                "New exchange rate must be lower"
+            );
+            require(
+                (request.liquidCanto2CantoExchangeRate * 8) / 10 <=
+                    _newRates[i],
+                "New exchange rate cannot drop more than 20 percent"
+            );
+            uint256 oldRate = request.liquidCro2CroExchangeRate;
+            request.liquidCro2CroExchangeRate = _newRates[i];
+
+            emit SlashRequest(_tokenIds[i], oldRate, _newRates[i]);
+        }
+    }
+
+    /**
+     * @dev see interface on detailed instruction, only execute this after calculating how much
+     *      canto to slash between unbonding users / protocol (both parties should slash by equal percentage)
+     */
+    function slash(
+        string calldata _validatorAddress,
+        uint256 _amount,
+        uint256 _time
+    ) external override onlyRole(ROLE_SLASHER) {
+        require(
+            validator2Time2AmountSlashed[_validatorAddress][_time] == 0,
+            "SLASH_RECORDED"
+        );
+        require(_amount > 0, "ZERO_AMOUNT");
+        // totalPooledCanto cannot go to 0, otherwise convertToShare will not mint the correct share for new stakers
+        require(
+            _amount < totalPooledCanto,
+            "amount must be less than totalPooledCanto"
+        );
+
+        validator2Time2AmountSlashed[_validatorAddress][_time] = _amount;
+        totalPooledCanto -= _amount;
+
+        emit Slash(_validatorAddress, _amount, _time);
+    }
+
+    /// @param _unbondingFee - 100 = 0.1%
+    function setUnbondingFee(
+        uint256 _unbondingFee
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_unbondingFee <= 1000, "Fee must be 1% or lower");
+
+        uint256 oldUnbondingFee = unbondingFee;
+        unbondingFee = _unbondingFee;
+        emit SetUnbondingFee(oldUnbondingFee, unbondingFee);
+    }
+
+    function setTreasury(
+        address _treasury
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_treasury != address(0), "EMPTY_ADDRESS");
+
+        address oldTreasury = treasury;
+        treasury = _treasury;
+        emit SetTreasury(oldTreasury, treasury);
+    }
+
+    /**
+     * @dev only called if canto network cosmos layer has a new proposal which changes the unbonding duration
+     */
+    function setUnbondingDuration(
+        uint256 _unbondingDuration
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            _unbondingDuration <= 28 days,
+            "_unbondingDuration is too high"
+        );
+
+        uint256 oldUnbondingDuration = unbondingDuration;
+        unbondingDuration = _unbondingDuration;
+
+        emit SetUnbondingDuration(oldUnbondingDuration, _unbondingDuration);
+    }
+
+    /**
+     * @dev Set unbonding processing time. Together with unbondingDuration, they will be used to
+     *      estimate the unlock time for user's unbonding request.
+     */
+    function setUnbondingProcessingTime(
+        uint256 _unbondingProcessingTime
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            _unbondingProcessingTime <= 7 days,
+            "_unbondingProcessingTime is too high"
+        );
+
+        uint256 oldUnbondingProcessingTime = unbondingProcessingTime;
+        unbondingProcessingTime = _unbondingProcessingTime;
+
+        emit SetUnbondingMaxProcessingTime(
+            oldUnbondingProcessingTime,
+            _unbondingProcessingTime
+        );
+    }
+
+    function convertToShare(uint256 cantoAmount) public view returns (uint256) {
+        uint256 totalSupply = totalSupply();
+
+        if (totalSupply == 0) return cantoAmount;
+        uint256 share = (cantoAmount * totalSupply) / totalPooledCanto;
+        // Protect user in the case where user deposit in small amount resulting in 0 share
+        require(share > 0, "Invalid share");
+
+        return share;
+    }
+
+    function convertToAsset(uint256 shareAmount) public view returns (uint256) {
+        uint256 totalSupply = totalSupply();
+
+        if (totalSupply == 0) return 0;
+        return (shareAmount * totalPooledCanto) / totalSupply;
+    }
+
+    function convertToAssetWithUnbondingFee(
+        uint256 shareAmount
+    ) public view override returns (uint256 croAmt, uint256 unbondingFeeAmt) {
+        uint256 totalCroAmount = convertToAsset(shareAmount);
+
+        unbondingFeeAmt =
+            (totalCroAmount * unbondingFee) /
+            UNBONDING_FEE_DENOMINATOR;
+        croAmt = totalCroAmount - unbondingFeeAmt;
+    }
+
+    function getUnbondRequestLength() external view returns (uint256) {
+        return unbondRequests.length();
+    }
+
+    function getUnbondRequests(
+        uint256 limit,
+        uint256 offset
+    ) external view returns (uint256[] memory) {
+        uint256[] memory elements = new uint256[](limit);
+
+        for (uint256 i = 0; i < elements.length; i++) {
+            elements[i] = unbondRequests.at(i + offset);
+        }
+
+        return elements;
+    }
+
+    // TODO check this function ,to make sure all the time durations
+    /**
+     * @notice This is an estimation unlock date
+     * @return unboundUnlockDate if the user unbond now
+     */
+    function getUnbondUnlockDate() public view returns (uint256) {
+        // Check if previous batch is in PROCESSING status. If processing, assume unbonding will be successful
+        // soon and thus return unlockTime as block.timestamp + unbondingProcessingTime + unbondingDuration;
+        // Note: If this is not in place, it means that protocol will promise an earlier unlock date than possible
+        //       during this window of processing -> unbonding (1 hour)
+        if (currentUnbondingBatchNo > 0) {
+            if (
+                batch2UnbondingStatus[currentUnbondingBatchNo - 1] ==
+                UnbondingStatus.PROCESSING
+            ) {
+                return
+                    block.timestamp +
+                    unbondingProcessingTime +
+                    unbondingDuration;
+            }
+        }
+        uint256 nextUnbondTime = lastUnbondTime + unbondingProcessingTime;
+        if (nextUnbondTime < block.timestamp) {
+            // This happen when contract just deployed (lastUnbondTime = 0) or when the bot has not unbonded
+            // since 4 days 12 hours ago (unbondingProcessingTime), could be bot issue.
+            // If this is not in place, it means that the protocol will promise an earlier unlock date than possible
+            return
+                block.timestamp + unbondingProcessingTime + unbondingDuration;
+        }
+
+        return nextUnbondTime + unbondingDuration;
     }
 }
