@@ -11,7 +11,6 @@ import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "./AccrueNFT.sol";
 
 contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
-    // TODO Make this contract can receive Canto
     // TODO Abstract an interface file
     AccrueNFT private accrueNFT;
 
@@ -153,9 +152,16 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     /// @notice Emitted when gather canto for delegate
     event GatherCantoForDelegate(uint256 amount);
 
-    constructor(address bot) ERC20("Liquid Canto", "LCanto") {
-        require(address(bot) != address(0), "ZERO ADDRESS");
+    constructor(
+        address bot,
+        address _treasury
+    ) ERC20("Liquid Canto", "LCanto") {
+        require(
+            address(bot) != address(0) && address(_treasury) != address(0),
+            "ZERO ADDRESS"
+        );
 
+        treasury = _treasury;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ROLE_BOT, bot);
 
@@ -482,7 +488,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         uint256 _unbondingDuration
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(
-            _unbondingDuration <= 28 days,
+            _unbondingDuration <= 21 days,
             "_unbondingDuration is too high"
         );
 
@@ -585,8 +591,11 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
             // This happen when contract just deployed (lastUnbondTime = 0) or when the bot has not unbonded
             // since 4 days 12 hours ago (unbondingProcessingTime), could be bot issue.
             // If this is not in place, it means that the protocol will promise an earlier unlock date than possible
-            return block.timestamp + unbondingProcessingTime + unbondingDuration;
+            return
+                block.timestamp + unbondingProcessingTime + unbondingDuration;
         }
         return nextUnbondTime + unbondingDuration;
     }
+
+    fallback() external payable {}
 }
