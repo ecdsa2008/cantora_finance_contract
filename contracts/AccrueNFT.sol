@@ -52,7 +52,9 @@ contract AccrueNFT is ERC721, ERC721Enumerable, Ownable {
     // Todo
     function tokenURI(
         uint256 _tokenId
-    ) public view override returns (string memory) {}
+    ) public view override returns (string memory) {
+        
+    }
 
     function supportsInterface(
         bytes4 interfaceId

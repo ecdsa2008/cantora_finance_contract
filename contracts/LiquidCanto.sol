@@ -15,11 +15,8 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     // TODO Abstract an interface file
     AccrueNFT private accrueNFT;
 
-    // TODO setup roles in constracts
     /// @dev includes action such as accrueReward, bridge, pause
     bytes32 public constant ROLE_BOT = keccak256("ROLE_BOT");
-    /// @dev include action involving user's fund (eg. slashing)
-    bytes32 public constant ROLE_SLASHER = keccak256("ROLE_SLASHER");
 
     // TODO setup treasury
     address public treasury;
@@ -151,16 +148,19 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     );
 
     /// @notice Emitted when AccrueNFT is created
-    event AccrueNFTCreate(address addr);
+    event AccrueNFTCreate(address creator, address addr);
 
     /// @notice Emitted when gather canto for delegate
     event GatherCantoForDelegate(uint256 amount);
 
-    // TODO Setup Roles
-    constructor() ERC20("Liquid Canto", "LCanto") {
+    constructor(address bot) ERC20("Liquid Canto", "LCanto") {
+        require(address(bot) != address(0), "ZERO ADDRESS");
+
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ROLE_BOT, bot);
+
         accrueNFT = new AccrueNFT(address(this));
-        emit AccrueNFTCreate(address(accrueNFT));
+        emit AccrueNFTCreate(address(this), address(accrueNFT));
     }
 
     // TODO Setup initial value
@@ -395,7 +395,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         _pause();
     }
 
-    function togglePause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function togglePause() external onlyRole(ROLE_BOT) {
         paused() ? _unpause() : _pause();
     }
 
@@ -403,7 +403,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     function slashUnbondingRequests(
         uint256[] calldata _tokenIds,
         uint256[] calldata _newRates
-    ) external onlyRole(ROLE_SLASHER) {
+    ) external onlyRole(ROLE_BOT) {
         require(
             _tokenIds.length == _newRates.length,
             "Both input length must match"
@@ -436,7 +436,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         string calldata _validatorAddress,
         uint256 _amount,
         uint256 _time
-    ) external override onlyRole(ROLE_SLASHER) {
+    ) external override onlyRole(ROLE_BOT) {
         require(
             validator2Time2AmountSlashed[_validatorAddress][_time] == 0,
             "SLASH_RECORDED"
@@ -565,7 +565,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
      * @return unboundUnlockDate if the user unbond now
      */
     function getUnbondUnlockDate() public view returns (uint256) {
-        // Check if previous batch is in PROCESSING status. If processing, assume unbonding will be successful
+        // Check if previous batch is in PROCESSx'x'x'xING status. If processing, assume unbonding will be successful
         // soon and thus return unlockTime as block.timestamp + unbondingProcessingTime + unbondingDuration;
         // Note: If this is not in place, it means that protocol will promise an earlier unlock date than possible
         //       during this window of processing -> unbonding (1 hour)
@@ -585,10 +585,8 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
             // This happen when contract just deployed (lastUnbondTime = 0) or when the bot has not unbonded
             // since 4 days 12 hours ago (unbondingProcessingTime), could be bot issue.
             // If this is not in place, it means that the protocol will promise an earlier unlock date than possible
-            return
-                block.timestamp + unbondingProcessingTime + unbondingDuration;
+            return block.timestamp + unbondingProcessingTime + unbondingDuration;
         }
-
         return nextUnbondTime + unbondingDuration;
     }
 }
