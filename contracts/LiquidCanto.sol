@@ -9,21 +9,26 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import "./AccrueNFT.sol";
+import "./interfaces/ILiquidCanto.sol";
 
-contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
+contract LiquidCanto is
+    ILiquidCanto,
+    ERC20,
+    Pausable,
+    AccessControl,
+    ReentrancyGuard
+{
     // TODO Abstract an interface file
     AccrueNFT private accrueNFT;
 
     /// @dev includes action such as accrueReward, bridge, pause
     bytes32 public constant ROLE_BOT = keccak256("ROLE_BOT");
 
-    // TODO setup treasury
     address public treasury;
 
     using EnumerableSet for EnumerableSet.UintSet;
     EnumerableSet.UintSet internal unbondRequests;
 
-    // TODO Create function to update
     // Batch no for new unbonding request, batch no will increase when current batch is processing
     // Update with ROLE BOT
     uint256 public currentUnbondingBatchNo;
@@ -40,18 +45,20 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     uint256 public constant EXCHANGE_RATE_PRECISION =
         10 ** EXCHANGE_RATE_DECIMAL;
 
-    // TODO enable to update fee by some roles
     // Unbonding fee  100 = 0.1%, 200 = 0.2%
     uint256 public unbondingFee;
+
     // Unbonding time by the bot, eg. 4 days 15 mins at the worst case
-    // 1. 4 days from max 7 unbonding per validator
+    // 1. 43 days from max 7 unbonding per validator
     // 2. 15 mins from bot processing (gather unbonding request)
     uint256 public unbondingProcessingTime;
+
     // Unbonding duration - eg. 21 days on canto network
     uint256 public unbondingDuration;
+
     // 1000 = 1% for unbonding fee, thus 100_000 represent 100%
     uint256 public constant UNBONDING_FEE_DENOMINATOR = 100_000;
-    // Last time where bot unbond from delegator
+    // Last time when bot unbond from delegator
     uint256 public lastUnbondTime;
 
     // tokenId to withdrawal request
@@ -77,81 +84,6 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         uint256 batchNo;
     }
 
-    enum UnbondingStatus {
-        PENDING_BOT, // batch is waiting for bot process
-        PROCESSING, // bot started processing, new unbonding request will be in next batch
-        UNBONDING, // bot finished processing unbonding request for this batch，bot has successfully informed validator to start unbonding
-        UNBONDED // batch is unbonded, user can redeem canto
-    }
-
-    /// @notice Emitted when user stake Canto
-    event Stake(
-        address indexed receiver,
-        uint256 CantoAmount,
-        uint256 shareAmount
-    );
-
-    /// @notice Emitted when a user request to unbond their staked Canto
-    event RequestUnbond(
-        address indexed receiver,
-        uint256 indexed tokenId,
-        uint256 shareAmount,
-        uint256 liquidCanto2CantoExchangeRate,
-        uint256 batchNo
-    );
-
-    /// @notice Emitted when a user redeems the NFT for Canto
-    event Unbond(
-        address indexed receiver,
-        uint256 indexed tokenId,
-        uint256 CantoAmount,
-        uint256 CantoFeeAmount
-    );
-
-    /// @notice Emitted when the bot has an update for an unbonding batch
-    event SetUnbondingBatchStatus(uint256 batchNo, UnbondingStatus status);
-
-    /// @notice Emitted when the bot claim reward on Canto cosmos layer
-    event AccrueReward(uint256 indexed amount, string indexed txnHash);
-
-    /// @notice Emitted when a slash happen on unbonding request
-    event SlashRequest(
-        uint256 tokenId,
-        uint256 oldExchangeRate,
-        uint256 newExchangeRate
-    );
-
-    /// @notice Emitted when a slash happen on Canto cosmos layer
-    event Slash(
-        string indexed validatorAddress,
-        uint256 indexed amount,
-        uint256 time
-    );
-
-    /// @notice Emitted when new unbonding fee is set
-    event SetUnbondingFee(uint256 oldFee, uint256 newFee);
-
-    /// @notice Emitted when new treasury is set
-    event SetTreasury(address oldTreasury, address newTreasury);
-
-    /// @notice Emitted when the unbonding duration is updated
-    event SetUnbondingDuration(
-        uint256 oldUnbondingDuration,
-        uint256 newUnbondingDuration
-    );
-
-    /// @notice Emitted when unbonding processing time is updated
-    event SetUnbondingMaxProcessingTime(
-        uint256 oldUnbondingMaxProcessingDuration,
-        uint256 newUnbondingMaxProcessingDuration
-    );
-
-    /// @notice Emitted when AccrueNFT is created
-    event AccrueNFTCreate(address creator, address addr);
-
-    /// @notice Emitted when gather canto for delegate
-    event GatherCantoForDelegate(uint256 amount);
-
     constructor(
         address bot,
         address _treasury
@@ -167,12 +99,15 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
 
         accrueNFT = new AccrueNFT(address(this));
         emit AccrueNFTCreate(address(this), address(accrueNFT));
-    }
 
-    // TODO Setup initial value
-    function init() private {
         batch2UnbondingStatus[currentUnbondingBatchNo] = UnbondingStatus
             .PENDING_BOT;
+
+        // Default 0.2%
+        unbondingFee = 200;
+        unbondingDuration = 21 days;
+
+        unbondingProcessingTime = 3 days + 12 hours;
     }
 
     function _beforeTokenTransfer(
@@ -193,6 +128,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         _mint(_receiver, shareAmount);
 
         totalPooledCanto += msg.value;
+        totalCantoStaked += msg.value;
 
         emit Stake(_receiver, msg.value, shareAmount);
         return shareAmount;
@@ -243,7 +179,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     function redeemCanto(
         uint256 _tokenId,
         address _receiver
-    ) public payable nonReentrant whenNotPaused returns (uint256) {
+    ) public nonReentrant whenNotPaused returns (uint256) {
         require(_receiver != address(0), "ZERO_ADDRESS");
         require(accrueNFT.isApprovedOrOwner(msg.sender, _tokenId), "NOT_OWNER");
 
@@ -280,7 +216,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     function batchRedeem(
         uint256[] calldata _tokenIds,
         address _receiver
-    ) public override returns (uint256) {
+    ) public returns (uint256) {
         uint256 totalCantoAmt;
         for (uint256 i; i < _tokenIds.length; i++) {
             totalCantoAmt += redeemCanto(_tokenIds[i], _receiver);
@@ -288,9 +224,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         return totalCantoAmt;
     }
 
-    // TODO
-    /// @dev deposit CRO into the contract, meant mostly for IBCReceiver to call
-    function deposit() external payable override {
+    function deposit() external payable {
         emit Deposit(msg.value);
     }
 
@@ -303,7 +237,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     function accrueReward(
         uint256 amount,
         string calldata txnHash
-    ) external override onlyRole(ROLE_BOT) {
+    ) external onlyRole(ROLE_BOT) {
         require(amount > 0, "ZERO_AMOUNT");
         require(txnHash2AccrueRewardAmount[txnHash] == 0, "ACCRUE_RECORDED");
 
@@ -320,7 +254,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         );
 
         totalCantoStaked -= amount;
-        msg.sender.transfer(amount);
+        payable(msg.sender).transfer(amount);
 
         emit GatherCantoForDelegate(amount);
     }
@@ -385,7 +319,6 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
             batch2UnbondingStatus[_batchNo] = UnbondingStatus.UNBONDING;
             emit SetUnbondingBatchStatus(_batchNo, UnbondingStatus.UNBONDING);
         } else if (_status == UnbondingStatus.UNBONDED) {
-            // UNBONDED - When bot has IBC the fund for the batch back to cronos
             require(
                 batchStatus == UnbondingStatus.UNBONDING,
                 "batchStatus should be UNBONDING"
@@ -397,11 +330,11 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     }
 
     // TODO need test
-    function pauseDueSlashing() external onlyRole(ROLE_BOT) {
+    function pauseDueSlashing() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
 
-    function togglePause() external onlyRole(ROLE_BOT) {
+    function togglePause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         paused() ? _unpause() : _pause();
     }
 
@@ -427,8 +360,8 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
                     _newRates[i],
                 "New exchange rate cannot drop more than 20 percent"
             );
-            uint256 oldRate = request.liquidCro2CroExchangeRate;
-            request.liquidCro2CroExchangeRate = _newRates[i];
+            uint256 oldRate = request.liquidCanto2CantoExchangeRate;
+            request.liquidCanto2CantoExchangeRate = _newRates[i];
 
             emit SlashRequest(_tokenIds[i], oldRate, _newRates[i]);
         }
@@ -442,7 +375,7 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
         string calldata _validatorAddress,
         uint256 _amount,
         uint256 _time
-    ) external override onlyRole(ROLE_BOT) {
+    ) external onlyRole(ROLE_BOT) {
         require(
             validator2Time2AmountSlashed[_validatorAddress][_time] == 0,
             "SLASH_RECORDED"
@@ -539,13 +472,13 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
 
     function convertToAssetWithUnbondingFee(
         uint256 shareAmount
-    ) public view override returns (uint256 croAmt, uint256 unbondingFeeAmt) {
-        uint256 totalCroAmount = convertToAsset(shareAmount);
+    ) public view returns (uint256 cantoAmt, uint256 unbondingFeeAmt) {
+        uint256 totalCantoAmount = convertToAsset(shareAmount);
 
         unbondingFeeAmt =
-            (totalCroAmount * unbondingFee) /
+            (totalCantoAmount * unbondingFee) /
             UNBONDING_FEE_DENOMINATOR;
-        croAmt = totalCroAmount - unbondingFeeAmt;
+        cantoAmt = totalCantoAmount - unbondingFeeAmt;
     }
 
     function getUnbondRequestLength() external view returns (uint256) {
@@ -598,4 +531,6 @@ contract LiquidCanto is ERC20, Pausable, AccessControl, ReentrancyGuard {
     }
 
     fallback() external payable {}
+
+    receive() external payable {}
 }
