@@ -18,7 +18,6 @@ contract LiquidCanto is
     AccessControl,
     ReentrancyGuard
 {
-    // TODO Abstract an interface file
     AccrueNFT private accrueNFT;
 
     /// @dev includes action such as accrueReward, bridge, pause
