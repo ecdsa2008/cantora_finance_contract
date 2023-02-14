@@ -24,7 +24,7 @@ contract LiquidCanto is
     bytes32 public constant ROLE_BOT = keccak256("ROLE_BOT");
 
     address public treasury;
-
+    address public immutable nft;
     using EnumerableSet for EnumerableSet.UintSet;
     EnumerableSet.UintSet internal unbondRequests;
 
@@ -47,8 +47,8 @@ contract LiquidCanto is
     // Unbonding fee  100 = 0.1%, 200 = 0.2%
     uint256 public unbondingFee;
 
-    // Unbonding time by the bot, eg. 4 days 15 mins at the worst case
-    // 1. 43 days from max 7 unbonding per validator
+    // Unbonding time by the bot, eg. 3 days 15 mins at the worst case
+    // 1. 3 days from max 7 unbonding per validator
     // 2. 15 mins from bot processing (gather unbonding request)
     uint256 public unbondingProcessingTime;
 
@@ -97,6 +97,7 @@ contract LiquidCanto is
         _grantRole(ROLE_BOT, bot);
 
         accrueNFT = new AccrueNFT(address(this));
+        nft = address(accrueNFT);
         emit AccrueNFTCreate(address(this), address(accrueNFT));
 
         batch2UnbondingStatus[currentUnbondingBatchNo] = UnbondingStatus
@@ -105,7 +106,6 @@ contract LiquidCanto is
         // Default 0.2%
         unbondingFee = 200;
         unbondingDuration = 21 days;
-
         unbondingProcessingTime = 3 days + 12 hours;
     }
 
@@ -521,7 +521,7 @@ contract LiquidCanto is
         uint256 nextUnbondTime = lastUnbondTime + unbondingProcessingTime;
         if (nextUnbondTime < block.timestamp) {
             // This happen when contract just deployed (lastUnbondTime = 0) or when the bot has not unbonded
-            // since 4 days 12 hours ago (unbondingProcessingTime), could be bot issue.
+            // since 3 days 12 hours ago (unbondingProcessingTime), could be bot issue.
             // If this is not in place, it means that the protocol will promise an earlier unlock date than possible
             return
                 block.timestamp + unbondingProcessingTime + unbondingDuration;
